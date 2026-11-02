@@ -23,8 +23,8 @@
 ## 3. Messages (UDP, little-endian)
 
 ```
-Initiation (2420 B):
-  type=1(u32) | sender_index(u32) | eph_dh(32) | kem_ct(1088)
+Initiation (3604 B):
+  type=1(u32) | sender_index(u32) | eph_dh(32) | kem_ct(1088) | eph_ek(1184)
   | enc_static(1232 = 32+1184+16) | enc_ts(28 = 12+16) | macs(32)
 
 Response (1180 B):
@@ -49,16 +49,22 @@ k1 = KDF(ss, "akkoro-hs-key-1", 16)   # seal initiator static identity
 k2 = KDF(ss, "akkoro-hs-key-2", 16)   # seal timestamp
 k3 = KDF(ss, "akkoro-hs-key-3", 16)   # seal response empty
 
-response adds: kem_ct2 = ML-KEM_encaps(initiator_static_ek)
+initiation also carries eph_ek (fresh ephemeral ML-KEM encapsulation key).
+response adds:  kem_ct2 = ML-KEM_encaps(eph_ek)        # ephemeral-to-ephemeral!
 final session secret = ss || ML-KEM_decaps(kem_ct2)   # PQ forward secrecy
 ```
+
+The response KEM is encapsulated to the initiator's **ephemeral** key, not its
+static identity key — so past sessions stay secret even if every long-term key
+is later compromised (true post-quantum forward secrecy). The ephemeral ML-KEM
+decapsulation key is wiped after the handshake.
 
 Three distinct keys with a fixed zero nonce ⇒ **no nonce reuse**.
 
 Transcript (both sides hash identical bytes):
 
 ```
-t = BLAKE3(NAME || eph_dh || kem_ct || enc_static || enc_ts || eph_dh_r || kem_ct2 || enc_empty)
+t = BLAKE3(NAME || eph_dh || kem_ct || eph_ek || enc_static || enc_ts || eph_dh_r || kem_ct2 || enc_empty)
 ```
 
 Session keys bind the full transcript:
@@ -83,13 +89,17 @@ recv    = KDF(master, "akkoro-recv", 16)   # responder:  send=B, recv=A
 
 Implemented since v0.1: **PQ forward secrecy** (ephemeral ML-KEM in the response),
 **cookie anti-DoS** (MAC1/MAC2), **rekey timers** (120 s/180 s), **mDNS discovery**,
-**padding**, and **ChaCha20-Poly1305 fallback**.
+**padding**, **ChaCha20-Poly1305 fallback**, **batched UDP I/O**
+(`recvmmsg`/`sendmmsg` + poll), and **GSO/GRO offload** (virtio_net_hdr +
+`TUNSETOFFLOAD`, verified ~4.5 Gbps TCP in Docker).
 
 Remaining:
 
 1. **AF_XDP fast path** (Linux-only) for sub-100 µs forwarding — the data path is
-   already split so a zero-copy backend can replace the UDP socket. Deferred:
-   Linux-specific and not exercisable in this lab without a dedicated NIC setup.
+   already split so a zero-copy backend can replace the UDP socket. GSO/GRO
+   (above) is the kernel-parity mechanism used meanwhile; AF_XDP would remove
+   the remaining syscall/copy cost. Deferred: Linux-specific and not
+   exercisable in this lab without a dedicated NIC setup.
 2. **macOS TUN (utun) end-to-end validation** — requires `sudo` on macOS; the
    Linux TUN + UDP + mDNS paths are already verified end-to-end in Docker.
 3. **Full PQ handshake (e.g., X-Wing)** — the current design is a hybrid

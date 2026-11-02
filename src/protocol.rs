@@ -21,7 +21,7 @@ pub const MESSAGE_DATA: u32 = 4;
 pub const COOKIE_LEN: usize = 16;
 pub const COOKIE_NONCE_LEN: usize = 16;
 
-pub const INITIATION_LEN: usize = 4 + 4 + X25519_KEY_LEN + MLKEM_CT_LEN
+pub const INITIATION_LEN: usize = 4 + 4 + X25519_KEY_LEN + MLKEM_CT_LEN + MLKEM_EK_LEN
     + (X25519_KEY_LEN + MLKEM_EK_LEN + AEAD_TAG_LEN)
     + (12 + AEAD_TAG_LEN)
     + (2 * COOKIE_LEN);
@@ -66,6 +66,10 @@ pub struct MessageInitiation {
     pub sender_index: u32,
     pub eph_dh: [u8; X25519_KEY_LEN],
     pub kem_ct: [u8; MLKEM_CT_LEN],
+    /// Ephemeral ML-KEM-768 encapsulation key (fresh per handshake) — the
+    /// responder encapsulates its ephemeral KEM to THIS key, giving true
+    /// post-quantum forward secrecy (not the static identity key).
+    pub eph_ek: [u8; MLKEM_EK_LEN],
     pub enc_static: Vec<u8>, // AEAD(static_dh_pub || static_ek)
     pub enc_ts: Vec<u8>,     // AEAD(timestamp)
     pub macs: MessageMacs,
@@ -96,6 +100,7 @@ impl MessageInitiation {
         v.extend_from_slice(&self.sender_index.to_le_bytes());
         v.extend_from_slice(&self.eph_dh);
         v.extend_from_slice(&self.kem_ct);
+        v.extend_from_slice(&self.eph_ek);
         v.extend_from_slice(&self.enc_static);
         v.extend_from_slice(&self.enc_ts);
         v.extend_from_slice(&self.macs.encode());
@@ -116,7 +121,10 @@ impl MessageInitiation {
         eph_dh.copy_from_slice(&buf[8..8 + X25519_KEY_LEN]);
         let mut kem_ct = [0u8; MLKEM_CT_LEN];
         kem_ct.copy_from_slice(&buf[8 + X25519_KEY_LEN..8 + X25519_KEY_LEN + MLKEM_CT_LEN]);
-        let enc_start = 8 + X25519_KEY_LEN + MLKEM_CT_LEN;
+        let mut eph_ek = [0u8; MLKEM_EK_LEN];
+        let eph_ek_start = 8 + X25519_KEY_LEN + MLKEM_CT_LEN;
+        eph_ek.copy_from_slice(&buf[eph_ek_start..eph_ek_start + MLKEM_EK_LEN]);
+        let enc_start = eph_ek_start + MLKEM_EK_LEN;
         let enc_static = buf[enc_start..enc_start + X25519_KEY_LEN + MLKEM_EK_LEN + AEAD_TAG_LEN].to_vec();
         let enc_ts = buf[enc_start + X25519_KEY_LEN + MLKEM_EK_LEN + AEAD_TAG_LEN..buf.len() - 2 * COOKIE_LEN].to_vec();
         let macs = MessageMacs::decode(&buf[buf.len() - 2 * COOKIE_LEN..])?;
@@ -124,6 +132,7 @@ impl MessageInitiation {
             sender_index: u32::from_le_bytes(buf[4..8].try_into().ok()?),
             eph_dh,
             kem_ct,
+            eph_ek,
             enc_static,
             enc_ts,
             macs,

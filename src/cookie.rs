@@ -148,7 +148,6 @@ mod tests {
 
     #[test]
     fn mac_and_cookie_flow() {
-        let a = IdentityKeys::generate();
         let b = IdentityKeys::generate();
         let b_pub = b.dh_public_bytes();
 

@@ -13,7 +13,9 @@ RUN cargo build --release
 # ---- runtime stage ----
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iputils-ping \
+    && apt-get install -y --no-install-recommends iproute2 iputils-ping iperf3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/akkoro /usr/local/bin/akkoro
-ENTRYPOINT ["akkoro"]
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]

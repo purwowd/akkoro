@@ -5,6 +5,7 @@
 //!
 //! Lab-only research artifact. See DESIGN.md.
 
+pub mod batch;
 pub mod config;
 pub mod cookie;
 pub mod crypto;

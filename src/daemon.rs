@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::batch::{recv_batch, send_batch, BATCH_SIZE, DATAGRAM_SIZE};
 use crate::config::Config;
 use crate::cookie::{self, CookieChecker, MacState};
 use crate::crypto::*;
@@ -17,7 +19,7 @@ use crate::handshake::{consume_initiation, consume_response, create_initiation, 
 use crate::protocol::*;
 use crate::route::{cidr_match, inner_dst_ip, inner_src_ip, parse_cidr, trim_inner_packet};
 use crate::session::*;
-use crate::tun::TunDevice;
+use crate::tun::{TunDevice, VNET_HDR_LEN};
 
 struct Peer {
     dh_pub: [u8; X25519_KEY_LEN],
@@ -159,17 +161,23 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // --- UDP receive thread ---
+    // --- UDP receive thread (batched recvmmsg) ---
     let udp_rx = udp.try_clone()?;
+    let rx_fd = udp_rx.as_raw_fd();
     let rx_shared = shared.clone();
     let rx_writer = tun_writer.clone();
     let rx = thread::spawn(move || {
-        let mut buf = vec![0u8; 65536];
+        let mut chunk = vec![0u8; BATCH_SIZE * DATAGRAM_SIZE];
+        let mut out: Vec<(usize, SocketAddr)> = Vec::with_capacity(BATCH_SIZE);
         loop {
-            match udp_rx.recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    if let Some(inner) = handle_udp(&rx_shared, &udp_rx, &buf[..n], from) {
-                        let _ = rx_writer.lock().unwrap().write_all(&inner);
+            match recv_batch(rx_fd, &mut chunk, BATCH_SIZE, &mut out) {
+                Ok(n) => {
+                    for i in 0..n {
+                        let (len, from) = out[i];
+                        let pkt = &chunk[i * DATAGRAM_SIZE..i * DATAGRAM_SIZE + len];
+                        if let Some(inner) = handle_udp(&rx_shared, &udp_rx, pkt, from) {
+                            let _ = rx_writer.lock().unwrap().write_all(&inner);
+                        }
                     }
                 }
                 Err(e) => eprintln!("[akkoro] udp recv: {e}"),
@@ -177,82 +185,47 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- TUN read (transmit) thread ---
+    // --- TUN read (transmit) thread: poll + drain + batched sendmmsg ---
     let udp_tx = udp.try_clone()?;
+    let tx_fd = udp_tx.as_raw_fd();
+    let tun_fd = tun_reader.as_raw_fd();
     let tx_shared = shared.clone();
     let tx = thread::spawn(move || {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; 70000]; // room for a GSO super-packet + vnet_hdr
+        let mut batch: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(BATCH_SIZE);
+        let mut pfd = libc::pollfd { fd: tun_fd, events: libc::POLLIN, revents: 0 };
         loop {
-            match tun_reader.read(&mut buf) {
-                Ok(n) => {
-                    let (out, endpoint) = {
-                        let mut peers = tx_shared.peers.lock().unwrap();
-                        let dst = match inner_dst_ip(&buf[..n]) {
-                            Some(d) => d,
-                            None => continue,
-                        };
-                        let name = match route(&peers, dst) {
-                            Some(nm) => nm,
-                            None => continue,
-                        };
-                        let peer = match peers.get_mut(&name) {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        // Time-based / counter-based rekey: drop the session so a
-                        // fresh handshake is triggered on the next packet.
-                        let need_rekey = match (&peer.session, &peer.session_birth) {
-                            (Some(_), Some(b)) => {
-                                b.elapsed().as_secs() >= REKEY_AFTER_TIME_SECS
-                                    || peer.send_counter >= REKEY_AFTER_MESSAGES
-                            }
-                            _ => false,
-                        };
-                        if need_rekey {
-                            peer.session = None;
-                            peer.session_birth = None;
-                        }
-                        if peer.session.is_none() && peer.pending.is_none() {
-                            let idx = peer.local_index;
-                            if let Some((mut msg, st)) = create_initiation(
-                                &tx_shared.identity,
-                                &peer.dh_pub,
-                                &peer.ek,
-                                tx_shared.psk.as_deref(),
-                                idx,
-                            ) {
-                                let mac_input = msg.mac_input();
-                                let mac1 = cookie::compute_mac1(&peer.mac1_key, &mac_input);
-                                let mac2 = match &peer.cookie {
-                                    Some((c, birth)) if cookie::cookie_fresh(*birth) => {
-                                        cookie::compute_mac2(c, &mac_input)
-                                    }
-                                    _ => [0u8; COOKIE_LEN],
-                                };
-                                msg.macs = MessageMacs { mac1, mac2 };
-                                peer.last_mac1_sent = Some(mac1);
-                                let bytes = msg.encode();
-                                let _ = udp_tx.send_to(&bytes, peer.endpoint);
-                                peer.pending = Some(st);
-                            }
-                        }
-                        let session = match &peer.session {
-                            Some(s) => s.clone(),
-                            None => continue,
-                        };
-                        let counter = peer.send_counter;
-                        if counter >= REJECT_AFTER_MESSAGES {
-                            continue;
-                        }
-                        peer.send_counter = peer.send_counter.wrapping_add(1);
-                        (encrypt_data(&session, tx_shared.cipher, peer.remote_index, counter, &buf[..n]), peer.endpoint)
-                    };
-                    let _ = udp_tx.send_to(&out, endpoint);
+            // Wait (with no busy-poll) for the TUN device to be readable.
+            let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+            if pr < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    eprintln!("[akkoro] tun poll error: {e}");
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if pr == 0 {
+                continue;
+            }
+            batch.clear();
+            for _ in 0..BATCH_SIZE {
+                match tun_reader.read(&mut buf) {
+                    Ok(n) => {
+                        if let Some(x) = encrypt_tx_packet(&tx_shared, &udp_tx, &buf[..n]) {
+                            batch.push(x);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        eprintln!("[akkoro] tun read: {e}");
+                        break;
+                    }
                 }
-                Err(e) => eprintln!("[akkoro] tun read: {e}"),
+            }
+            if !batch.is_empty() {
+                if let Err(e) = send_batch(tx_fd, &batch) {
+                    eprintln!("[akkoro] tx sendmmsg error: {e}");
+                }
             }
         }
     });
@@ -260,6 +233,62 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     rx.join().unwrap();
     tx.join().unwrap();
     Ok(())
+}
+
+/// Route + encrypt one inner IP packet; returns (wire_datagram, destination).
+/// If the peer has no session yet, this kicks off a handshake initiation and
+/// returns None (the packet is dropped this round, as in WireGuard).
+fn encrypt_tx_packet(shared: &Shared, sock: &UdpSocket, pkt_with_vhdr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+    if pkt_with_vhdr.len() < VNET_HDR_LEN {
+        return None;
+    }
+    // Route on the inner IP packet (after the virtio_net_hdr), but encrypt the
+    // WHOLE [vnet_hdr || packet] so GSO/GRO metadata survives end-to-end.
+    let ip_pkt = &pkt_with_vhdr[VNET_HDR_LEN..];
+    let mut peers = shared.peers.lock().unwrap();
+    let dst = inner_dst_ip(ip_pkt)?;
+    let name = route(&peers, dst)?;
+    let peer = peers.get_mut(&name)?;
+
+    // Time-based / counter-based rekey: drop the session so a fresh handshake
+    // is triggered on the next packet.
+    let need_rekey = match (&peer.session, &peer.session_birth) {
+        (Some(_), Some(b)) => b.elapsed().as_secs() >= REKEY_AFTER_TIME_SECS || peer.send_counter >= REKEY_AFTER_MESSAGES,
+        _ => false,
+    };
+    if need_rekey {
+        peer.session = None;
+        peer.session_birth = None;
+    }
+    if peer.session.is_none() && peer.pending.is_none() {
+        let idx = peer.local_index;
+        if let Some((mut msg, st)) = create_initiation(
+            &shared.identity,
+            &peer.dh_pub,
+            &peer.ek,
+            shared.psk.as_deref(),
+            idx,
+        ) {
+            let mac_input = msg.mac_input();
+            let mac1 = cookie::compute_mac1(&peer.mac1_key, &mac_input);
+            let mac2 = match &peer.cookie {
+                Some((c, birth)) if cookie::cookie_fresh(*birth) => cookie::compute_mac2(c, &mac_input),
+                _ => [0u8; COOKIE_LEN],
+            };
+            msg.macs = MessageMacs { mac1, mac2 };
+            peer.last_mac1_sent = Some(mac1);
+            let bytes = msg.encode();
+            let _ = sock.send_to(&bytes, peer.endpoint);
+            peer.pending = Some(st);
+        }
+    }
+    let session = peer.session.as_ref()?.clone();
+    let counter = peer.send_counter;
+    if counter >= REJECT_AFTER_MESSAGES {
+        return None;
+    }
+    peer.send_counter = peer.send_counter.wrapping_add(1);
+    Some((encrypt_data(&session, shared.cipher, peer.remote_index, counter, pkt_with_vhdr), peer.endpoint))
 }
 
 /// Handle one inbound UDP datagram. Returns the decrypted inner packet (for
@@ -401,14 +430,23 @@ fn handle_udp(shared: &Shared, sock: &UdpSocket, buf: &[u8], from: SocketAddr) -
                 return None;
             }
             let inner = decrypt_data(&recv_key, shared.cipher, counter, &buf[16..])?;
-            let inner = trim_inner_packet(&inner).to_vec();
+            if inner.len() < VNET_HDR_LEN {
+                return None;
+            }
+            // The decrypted payload is [vnet_hdr || ip_packet || padding].
+            let ip_pkt = trim_inner_packet(&inner[VNET_HDR_LEN..]);
             // Reverse-path check: the inner source IP must belong to this peer's
             // allowed_ips (prevents one peer spoofing another's inner addresses).
-            let src = inner_src_ip(&inner)?;
+            let src = inner_src_ip(ip_pkt)?;
             if !p.allowed_ips.iter().any(|(net, prefix)| cidr_match(net, *prefix, src)) {
                 return None;
             }
-            Some(inner)
+            // Reassemble [vnet_hdr || ip_packet] and hand it to the TUN (the
+            // vnet_hdr preserves GSO/GRO metadata for the receiving kernel).
+            let mut out = Vec::with_capacity(VNET_HDR_LEN + ip_pkt.len());
+            out.extend_from_slice(&inner[..VNET_HDR_LEN]);
+            out.extend_from_slice(ip_pkt);
+            Some(out)
         }
         _ => None,
     }

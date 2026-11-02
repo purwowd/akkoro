@@ -1,0 +1,7 @@
+target
+.git
+.DS_Store
+identity.toml
+*-identity.toml
+*-id.toml
+akkoro.toml

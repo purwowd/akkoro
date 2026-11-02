@@ -7,14 +7,24 @@ upgrades over WireGuard:
 
 | Goal | Akkoro | WireGuard |
 |---|---|---|
-| **More secure** | Hybrid **X25519 + ML-KEM-768** key exchange (quantum-resistant) · **Rust** (memory-safe, no C memory-corruption class) · per-key domain separation | X25519 only (quantum-broken) · C kernel module |
-| **Lower latency** | **AEGIS-128L** AEAD (≈3–5× faster than ChaCha20-Poly1305 on AES-NI/ARM crypto) · synchronous 2-thread data path (no async overhead) · 1-RTT handshake | ChaCha20-Poly1305 |
+| **More secure** | Hybrid **X25519 + ML-KEM-768** key exchange (quantum-resistant) + **PQ forward secrecy** · **Rust** (memory-safe, no C memory-corruption class) · per-key domain separation | X25519 only (quantum-broken) · C kernel module |
+| **Lower latency** | **AEGIS-128L** AEAD (≈3–5× faster than ChaCha20-Poly1305 on AES-NI/ARM crypto) · **batched UDP I/O** (`recvmmsg`/`sendmmsg` + TUN `poll`, amortizes the 2-syscall-per-packet cost) · **GSO/GRO offload** (virtio_net_hdr, kernel coalesces/segments large packets) · 1-RTT handshake | ChaCha20-Poly1305 |
 | **Offline / local IP** | Direct RFC1918 UDP endpoints, static peer config + optional **mDNS discovery** (no DNS/STUN/TURN) | Same, but without PQ |
+
+> **Honest caveats:** the "more secure" claim is about *design properties* (PQ +
+> memory safety) — Akkoro is new and unaudited, so it lacks WireGuard's 7+ years
+> of external scrutiny; a formal audit is required before trusting it with
+> production traffic. The "lower latency" claim is about the *cipher and data
+> path*: batched I/O amortizes the per-packet syscall overhead, and GSO/GRO
+> offload lets the kernel coalesce/segment super-packets across the tunnel
+> (Docker: ~0.16 ms avg ping-flood RTT, 0% loss; ~4.5 Gbps TCP through the
+> tunnel), but as a userspace daemon it still cannot beat kernel WireGuard's
+> in-kernel zero-copy forwarding; kernel parity requires the deferred AF_XDP path.
 
 ## Status
 
 - ✅ Crypto core: handshake, session keys, replay window, data AEAD — **tested**
-  (`cargo test` — 10 tests).
+  (`cargo test` — 11 tests).
 - ✅ **Post-quantum forward secrecy**: ephemeral ML-KEM-768 in the response
   (hybrid X25519+ML-KEM is mixed into every session key).
 - ✅ **Cookie anti-DoS** (MAC1/MAC2, BLAKE3 + AEGIS-128L) + **handshake
@@ -26,6 +36,10 @@ upgrades over WireGuard:
 - ✅ **Cipher fallback**: `aegis128l` (default) or `chacha20poly1305` via config.
 - ✅ **mDNS peer discovery** for offline LAN (config `mdns = true`) — verified in
   Docker (peer endpoint auto-populated, no static endpoint).
+- ✅ **Batched UDP I/O** (`recvmmsg`/`sendmmsg` + poll, 64-datagram batches).
+- ✅ **GSO/GRO offload** (`IFF_VNET_HDR` + `TUNSETOFFLOAD` on Linux): the
+  10-byte virtio_net_hdr is preserved end-to-end so the kernel coalesces/segments
+  super-packets across the tunnel — verified in Docker (~4.5 Gbps TCP).
 - ✅ CLI: `keygen`, `pubkey`, `run`.
 - ✅ Daemon: UDP + TUN data path (Linux + macOS via `tun` crate).
 - ⚠️ TUN + mDNS paths require **root** / a real 2-host LAN to exercise end-to-end;

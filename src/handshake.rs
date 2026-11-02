@@ -23,9 +23,10 @@ pub struct InitiatorState {
     shared_secret: Vec<u8>,
     /// transcript updated through `enc_ts`.
     transcript: Transcript,
-    /// Initiator's static ML-KEM decapsulation key (to decapsulate the
-    /// responder's ephemeral KEM for post-quantum forward secrecy).
-    kem_decap: MlKemDecapKey,
+    /// Initiator's EPHEMERAL ML-KEM decapsulation key (fresh per handshake) —
+    /// used to decapsulate the responder's ephemeral KEM. This is what gives
+    /// post-quantum forward secrecy: the key is wiped after the handshake.
+    eph_kem_decap: MlKemDecapKey,
 }
 
 impl Drop for InitiatorState {
@@ -57,6 +58,11 @@ pub fn create_initiation(
     let eph_private = x25519_dalek::StaticSecret::random();
     let eph_dh = x25519_dalek::PublicKey::from(&eph_private).to_bytes();
 
+    // Ephemeral ML-KEM keypair for post-quantum forward secrecy: the responder
+    // will encapsulate its own ephemeral KEM to this key.
+    let eph_kem = MlKemKeypair::generate();
+    let eph_ek: [u8; MLKEM_EK_LEN] = eph_kem.encap_bytes().as_slice().try_into().ok()?;
+
     let (kem_ct, kem_ss) = mlkem_encapsulate(peer_ek)?;
     let dh_ss = x25519(&eph_private, peer_dh_pub);
 
@@ -75,6 +81,7 @@ pub fn create_initiation(
     let mut transcript = Transcript::new();
     transcript.update(&eph_dh);
     transcript.update(&kem_ct);
+    transcript.update(&eph_ek);
 
     let mut static_pt = Vec::with_capacity(STATIC_PT_LEN);
     static_pt.extend_from_slice(&identity.dh_public_bytes());
@@ -92,8 +99,8 @@ pub fn create_initiation(
     let mut eph_private_bytes = eph_private.to_bytes(); eph_private_bytes.zeroize();
     k1.zeroize(); k2.zeroize();
 
-    let msg = MessageInitiation { sender_index, eph_dh, kem_ct, enc_static, enc_ts, macs: MessageMacs::default() };
-    Some((msg, InitiatorState { shared_secret, transcript, kem_decap: identity.kem.decap.clone() }))
+    let msg = MessageInitiation { sender_index, eph_dh, kem_ct, eph_ek, enc_static, enc_ts, macs: MessageMacs::default() };
+    Some((msg, InitiatorState { shared_secret, transcript, eph_kem_decap: eph_kem.decap }))
 }
 
 /// Process the handshake response and derive session keys (initiator side).
@@ -112,8 +119,9 @@ pub fn consume_response(state: InitiatorState, response: &MessageResponse) -> Op
     transcript.update(&response.enc_empty);
     let final_hash = transcript.finalize();
 
-    // Post-quantum forward secrecy: decapsulate the responder's ephemeral KEM.
-    let kem_ss2 = mlkem_decapsulate(&state.kem_decap, &response.kem_ct);
+    // Post-quantum forward secrecy: decapsulate the responder's ephemeral KEM
+    // using our EPHEMERAL (not static) ML-KEM key.
+    let kem_ss2 = mlkem_decapsulate(&state.eph_kem_decap, &response.kem_ct);
     let mut shared_final = state.shared_secret.clone();
     shared_final.extend_from_slice(&kem_ss2);
 
@@ -148,6 +156,7 @@ pub fn consume_initiation(
     let mut transcript = Transcript::new();
     transcript.update(&msg.eph_dh);
     transcript.update(&msg.kem_ct);
+    transcript.update(&msg.eph_ek);
 
     // decrypt initiator static identity
     let static_pt = aead_open(&k1, &ZERO_NONCE, &msg.enc_static, &transcript.finalize())?;
@@ -169,10 +178,12 @@ pub fn consume_initiation(
     timestamp.copy_from_slice(&ts);
     transcript.update(&msg.enc_ts);
 
-    // response ephemerals: X25519 + ephemeral ML-KEM (post-quantum forward secrecy)
+    // response ephemerals: X25519 + ephemeral ML-KEM (post-quantum forward secrecy).
+    // The responder encapsulates its ephemeral KEM to the initiator's EPHEMERAL
+    // key (msg.eph_ek), NOT the static identity key.
     let eph_private_r = x25519_dalek::StaticSecret::random();
     let eph_dh_r = x25519_dalek::PublicKey::from(&eph_private_r).to_bytes();
-    let (kem_ct2, kem_ss2) = mlkem_encapsulate(&init_ek)?;
+    let (kem_ct2, kem_ss2) = mlkem_encapsulate(&msg.eph_ek)?;
 
     transcript.update(&eph_dh_r);
     transcript.update(&kem_ct2);
