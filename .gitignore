@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Generated identities contain PRIVATE keys (dh_private + kem_seed) — never commit
+identity.toml
+*-identity.toml
+*-id.toml
+
+# Local runtime config may contain a PSK
+akkoro.toml
+*.local.toml
+
+# macOS
+.DS_Store

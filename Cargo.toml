@@ -1,0 +1,36 @@
+[package]
+name = "akkoro"
+version = "0.1.0"
+edition = "2021"
+description = "Akkoro — a post-quantum, low-latency L3 VPN tunnel (WireGuard-class, lab-only)"
+
+[lib]
+name = "akkoro"
+path = "src/lib.rs"
+
+[[bin]]
+name = "akkoro"
+path = "src/main.rs"
+
+[dependencies]
+aegis = "0.9"
+blake3 = "1.8"
+x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+ml-kem = { version = "0.3", features = ["getrandom"] }
+hkdf = "0.13"
+sha2 = "0.11"
+rand = "0.9"
+zeroize = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+tun = "0.8"
+chacha20poly1305 = "0.11.0"
+aead = "0.6.1"
+mdns-sd = "0.21.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
