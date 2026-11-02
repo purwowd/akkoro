@@ -19,7 +19,7 @@ use crate::handshake::{consume_initiation, consume_response, create_initiation, 
 use crate::protocol::*;
 use crate::route::{cidr_match, inner_dst_ip, inner_src_ip, parse_cidr, trim_inner_packet};
 use crate::session::*;
-use crate::tun::{TunDevice, VNET_HDR_LEN};
+use crate::tun::TunDevice;
 
 struct Peer {
     dh_pub: [u8; X25519_KEY_LEN],
@@ -55,6 +55,21 @@ fn random_index() -> u32 {
     rand::rng().random::<u32>()
 }
 
+fn ipv4_netmask(prefix: u8) -> String {
+    let prefix = prefix.min(32);
+    let m = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix) };
+    let b = m.to_be_bytes();
+    format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+}
+
+fn inner_ip(pkt: &[u8]) -> Option<&[u8]> {
+    Some(pkt)
+}
+
+fn tun_write_payload(ip: &[u8]) -> Vec<u8> {
+    ip.to_vec()
+}
+
 fn route(peers: &HashMap<String, Peer>, dst: std::net::IpAddr) -> Option<String> {
     let mut best: Option<(String, u8)> = None;
     for (name, p) in peers {
@@ -74,11 +89,26 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let udp = UdpSocket::bind(&cfg.listen)?;
 
+    let inner_addr = cfg.address.split('/').next().unwrap_or("10.9.0.1");
+    let prefix: u8 = cfg
+        .address
+        .split('/')
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(24);
+    let netmask = ipv4_netmask(prefix);
+    let destination = cfg.peers.iter().find_map(|p| {
+        p.allowed_ips
+            .first()
+            .and_then(|cidr| cidr.split('/').next())
+            .map(str::to_string)
+    });
     let tun = TunDevice::create(
         &cfg.interface,
-        cfg.address.split('/').next().unwrap_or("10.9.0.1"),
-        "255.255.255.0",
+        inner_addr,
+        &netmask,
         cfg.mtu,
+        destination.as_deref(),
     )?;
     eprintln!("[akkoro] TUN device {} up (mtu {})", tun.name(), cfg.mtu);
     tun.set_nonblock()?;
@@ -239,12 +269,7 @@ pub fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 /// If the peer has no session yet, this kicks off a handshake initiation and
 /// returns None (the packet is dropped this round, as in WireGuard).
 fn encrypt_tx_packet(shared: &Shared, sock: &UdpSocket, pkt_with_vhdr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
-    if pkt_with_vhdr.len() < VNET_HDR_LEN {
-        return None;
-    }
-    // Route on the inner IP packet (after the virtio_net_hdr), but encrypt the
-    // WHOLE [vnet_hdr || packet] so GSO/GRO metadata survives end-to-end.
-    let ip_pkt = &pkt_with_vhdr[VNET_HDR_LEN..];
+    let ip_pkt = trim_inner_packet(inner_ip(pkt_with_vhdr)?);
     let mut peers = shared.peers.lock().unwrap();
     let dst = inner_dst_ip(ip_pkt)?;
     let name = route(&peers, dst)?;
@@ -288,7 +313,7 @@ fn encrypt_tx_packet(shared: &Shared, sock: &UdpSocket, pkt_with_vhdr: &[u8]) ->
         return None;
     }
     peer.send_counter = peer.send_counter.wrapping_add(1);
-    Some((encrypt_data(&session, shared.cipher, peer.remote_index, counter, pkt_with_vhdr), peer.endpoint))
+    Some((encrypt_data(&session, shared.cipher, peer.remote_index, counter, ip_pkt), peer.endpoint))
 }
 
 /// Handle one inbound UDP datagram. Returns the decrypted inner packet (for
@@ -430,23 +455,14 @@ fn handle_udp(shared: &Shared, sock: &UdpSocket, buf: &[u8], from: SocketAddr) -
                 return None;
             }
             let inner = decrypt_data(&recv_key, shared.cipher, counter, &buf[16..])?;
-            if inner.len() < VNET_HDR_LEN {
-                return None;
-            }
-            // The decrypted payload is [vnet_hdr || ip_packet || padding].
-            let ip_pkt = trim_inner_packet(&inner[VNET_HDR_LEN..]);
+            let ip_pkt = trim_inner_packet(&inner);
             // Reverse-path check: the inner source IP must belong to this peer's
             // allowed_ips (prevents one peer spoofing another's inner addresses).
             let src = inner_src_ip(ip_pkt)?;
             if !p.allowed_ips.iter().any(|(net, prefix)| cidr_match(net, *prefix, src)) {
                 return None;
             }
-            // Reassemble [vnet_hdr || ip_packet] and hand it to the TUN (the
-            // vnet_hdr preserves GSO/GRO metadata for the receiving kernel).
-            let mut out = Vec::with_capacity(VNET_HDR_LEN + ip_pkt.len());
-            out.extend_from_slice(&inner[..VNET_HDR_LEN]);
-            out.extend_from_slice(ip_pkt);
-            Some(out)
+            Some(tun_write_payload(ip_pkt))
         }
         _ => None,
     }

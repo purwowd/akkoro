@@ -3,64 +3,48 @@
 use tun::{Configuration, Device, Layer};
 use std::io::{Read, Write};
 
-/// Linux `virtio_net_hdr` size. When IFF_VNET_HDR is enabled, TUN reads/writes
-/// are prefixed with this 10-byte header (carrying GSO/GRO metadata).
-pub const VNET_HDR_LEN: usize = 10;
-
-// TUNSETOFFLOAD = _IOW('T', 208, unsigned int)
-#[cfg(target_os = "linux")]
-const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54D0;
-#[cfg(target_os = "linux")]
-const TUN_F_CSUM: libc::c_uint = 0x01;
-#[cfg(target_os = "linux")]
-const TUN_F_TSO4: libc::c_uint = 0x02;
-#[cfg(target_os = "linux")]
-const TUN_F_TSO6: libc::c_uint = 0x04;
-
 pub struct TunDevice {
     dev: Device,
 }
 
 impl TunDevice {
     /// Create an L3 TUN device, assign the inner address, and bring it up.
-    /// On Linux, GSO/GRO offload (IFF_VNET_HDR + TUNSETOFFLOAD) is enabled so
-    /// the kernel can coalesce/segment large packets across the tunnel.
-    pub fn create(name: &str, address: &str, netmask: &str, mtu: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `destination` is the point-to-point peer; macOS needs it to install a
+    /// utun route.
+    pub fn create(
+        name: &str,
+        address: &str,
+        netmask: &str,
+        mtu: u16,
+        destination: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = Configuration::default();
+        // Linux accepts akkoro0. macOS only accepts utunN; omit the name and
+        // let the kernel pick one.
+        #[cfg(not(target_os = "macos"))]
+        config.tun_name(name);
+        #[cfg(target_os = "macos")]
+        let _ = name;
         config
-            .tun_name(name)
             .address(address)
             .netmask(netmask)
             .mtu(mtu)
             .up()
             .layer(Layer::L3);
+        if let Some(dst) = destination {
+            config.destination(dst);
+        }
 
-        // On macOS, disable the 4-byte address-family prefix so reads/writes
-        // are raw IP packets, matching Linux.
+        // utun always prefixes a 4-byte AF header; PI must stay on so the crate strips it.
         #[cfg(target_os = "macos")]
         config.platform_config(|pc| {
-            pc.packet_information(false);
+            pc.packet_information(true);
         });
 
-        // On Linux, enable GSO/GRO offload (virtio_net_hdr + TUNSETOFFLOAD).
-        #[cfg(target_os = "linux")]
-        config.platform_config(|pc| {
-            pc.vnet_hdr(true);
-        });
-
+        // Do not enable IFF_VNET_HDR / TUNSETOFFLOAD. Checksum offload leaves a
+        // placeholder TCP checksum on the wire; macOS utun drops those packets
+        // (ICMP still works, SSH hangs).
         let dev = tun::create(&config)?;
-
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            // NOTE: unlike the _IOW macro suggests, the kernel reads this arg
-            // as the offload bitmask VALUE directly, not as a pointer.
-            let offload: libc::c_ulong = (TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6) as libc::c_ulong;
-            let rc = unsafe { libc::ioctl(dev.as_raw_fd(), TUNSETOFFLOAD, offload) };
-            if rc < 0 {
-                eprintln!("[akkoro] TUNSETOFFLOAD failed (GSO/GRO disabled): {}", std::io::Error::last_os_error());
-            }
-        }
 
         Ok(Self { dev })
     }
