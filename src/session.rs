@@ -9,6 +9,13 @@ pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - COUNTER_WINDOW_SIZE - 1;
 /// Time-based rekey / reject thresholds.
 pub const REKEY_AFTER_TIME_SECS: u64 = 120;
 pub const REJECT_AFTER_TIME_SECS: u64 = 180;
+/// Empty-packet keepalive when a peer has been idle this long (WireGuard default).
+pub const KEEPALIVE_DEFAULT_SECS: u64 = 21;
+/// Inner packets held while a handshake is in flight.
+pub const TX_QUEUE_CAP: usize = 32;
+/// Handshake initiation retry backoff.
+pub const INIT_RETRY_MIN_MS: u64 = 1000;
+pub const INIT_RETRY_MAX_MS: u64 = 8000;
 /// Data padding multiple (anti traffic-analysis).
 pub const MESSAGE_PADDING_MULTIPLE: usize = 16;
 

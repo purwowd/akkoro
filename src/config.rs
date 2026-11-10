@@ -46,6 +46,9 @@ pub struct PeerConfig {
     /// Allowed inner IPs for this peer (CIDR strings).
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+    /// Seconds between empty keepalive datagrams. 0 disables. Default 21.
+    #[serde(default = "default_keepalive")]
+    pub persistent_keepalive: u64,
 }
 
 /// Top-level configuration.
@@ -84,6 +87,39 @@ fn default_mtu() -> u16 {
 
 fn default_cipher() -> String {
     "aegis128l".to_string()
+}
+
+fn default_keepalive() -> u64 {
+    crate::session::KEEPALIVE_DEFAULT_SECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keepalive_defaults_to_21() {
+        let t = r#"
+            name = "x"
+            endpoint = "1.2.3.4:1"
+            dh_pub = "00"
+            ek = "00"
+        "#;
+        let p: PeerConfig = toml::from_str(t).unwrap();
+        assert_eq!(
+            p.persistent_keepalive,
+            crate::session::KEEPALIVE_DEFAULT_SECS
+        );
+        let t0 = r#"
+            name = "x"
+            endpoint = "1.2.3.4:1"
+            dh_pub = "00"
+            ek = "00"
+            persistent_keepalive = 0
+        "#;
+        let p0: PeerConfig = toml::from_str(t0).unwrap();
+        assert_eq!(p0.persistent_keepalive, 0);
+    }
 }
 
 impl Config {

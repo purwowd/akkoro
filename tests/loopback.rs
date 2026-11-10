@@ -3,6 +3,7 @@
 use akkoro::crypto::*;
 use akkoro::handshake::{consume_initiation, consume_response, create_initiation};
 use akkoro::protocol::*;
+use akkoro::route::{inner_dst_ip, inner_src_ip};
 use akkoro::session::*;
 
 #[test]
@@ -90,6 +91,16 @@ fn mlkem_serialization_roundtrip() {
 
     let seed = k.seed_bytes();
     assert_eq!(seed.len(), MLKEM_SEED_LEN);
+}
+
+#[test]
+fn empty_keepalive_is_not_an_ip_packet() {
+    let initiator = SessionKeys::derive(&[1u8; 64], &[2u8; 32], true);
+    let responder = SessionKeys::derive(&[1u8; 64], &[2u8; 32], false);
+    let ct = encrypt_data(&initiator, Cipher::Aegis128L, 1, 0, &[]);
+    let pt = decrypt_data(&responder.recv_key, Cipher::Aegis128L, 0, &ct[16..]).unwrap();
+    assert!(inner_src_ip(&pt).is_none());
+    assert!(inner_dst_ip(&pt).is_none());
 }
 
 #[test]
